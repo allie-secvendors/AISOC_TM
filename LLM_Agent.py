@@ -16,6 +16,7 @@ import streamlit as st
 from langchain_community.utilities import SQLDatabase
 from langchain_openai import ChatOpenAI
 import openai
+import re
 
 from pydantic import BaseModel, Field
 from typing import Dict, List, Optional, Any
@@ -85,6 +86,48 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+def validate_sql_query(sql_query):
+    """
+    Validates SQL query for potentially dangerous operations.
+    
+    Args:
+        sql_query (str): SQL query to validate
+    
+    Returns:
+        tuple: (is_safe, message) where is_safe is a boolean and message contains validation details
+    """
+    if not sql_query or not isinstance(sql_query, str):
+        return False, "Empty or invalid SQL query"
+    
+    # Convert to lowercase for case-insensitive matching
+    sql_lower = sql_query.lower()
+    
+    # Check for dangerous SQL operations
+    dangerous_patterns = [
+        (r'\bdrop\b', "DROP operation detected"),
+        (r'\bdelete\b(?!.*\bwhere\b)', "DELETE without WHERE clause"),
+        (r'\btruncate\b', "TRUNCATE operation detected"),
+        (r'\balter\b', "ALTER operation detected"),
+        (r'\bcreate\s+user\b', "User creation operation detected"),
+        (r'\bgrant\b', "GRANT permission operation detected"),
+        (r'\binto\s+outfile\b', "File system write operation detected"),
+        (r'\bload_file\b', "File system read operation detected"),
+        (r'\bexec\b|\bexecute\b', "Command execution detected"),
+        (r'\bsys\b|\bsystem\b', "System function detected"),
+        (r';(?!\s*$)', "Multiple SQL statements detected"),
+        (r'\bupdate\b(?!.*\bwhere\b)', "UPDATE without WHERE clause"),
+        (r'--', "SQL comment detected"),
+        (r'/\*', "SQL comment block detected")
+    ]
+    
+    for pattern, message in dangerous_patterns:
+        if re.search(pattern, sql_lower):
+            return False, message
+    
+    # Additional security checks can be added here
+    
+    return True, "SQL query passed validation"
+
 # Define the Agentic  SQL tool using the @tool decorator - To generate SQL
 @tool
 def generate_sql_query(requirement):
@@ -95,18 +138,66 @@ def generate_sql_query(requirement):
        Returns:
            str: Generated SQL query based on the requirement
     """
-    prompt = f"""You are an expert SQL developer. Convert the following requirement into a well-written SQL query:
+    # Enhanced prompt with security guidelines
+    prompt = f"""You are an expert SQL developer. Convert the following requirement into a well-written SQL query.
+    
+SECURITY GUIDELINES:
+1. Only write SELECT statements that read data - no modification operations
+2. Do not use any destructive operations (DROP, DELETE, UPDATE, ALTER, TRUNCATE)
+3. Do not use multiple SQL statements (no semicolons except at the end)
+4. Avoid system tables, stored procedures, or sensitive system information
+5. Write queries that are appropriate for a monitoring/analysis context
 
+Requirement:
 {requirement}
 
 SQL Query:"""
     try:
         response = client.chat.completions.create(model="gpt-4",
-        messages=[{"role": "developer", "content": "You are an expert AI assistant."},
+        messages=[{"role": "system", "content": "You are an expert AI assistant focused on secure SQL generation."},
                   {"role": "user", "content": prompt}],
         max_tokens=300,
         temperature=0.0)
-        return response.choices[0].message.content.strip()
+        
+        generated_sql = response.choices[0].message.content.strip()
+        
+        # Validate the generated SQL
+        is_safe, reason = validate_sql_query(generated_sql)
+        
+        if not is_safe:
+            print(f"Warning: Potentially unsafe SQL generated: {reason}")
+            
+            # Try to generate a safer version
+            safe_prompt = f"""The previously generated SQL query was flagged as potentially unsafe: {reason}
+            
+Please rewrite the query following these strict security guidelines:
+1. Use ONLY SELECT statements for read-only operations
+2. Do not use any data modification operations
+3. Focus solely on data retrieval and analysis
+4. Avoid any system tables or procedures
+
+Original requirement: {requirement}
+
+Safe SQL Query:"""
+            
+            safe_response = client.chat.completions.create(model="gpt-4",
+            messages=[{"role": "system", "content": "You are a security-focused SQL expert."},
+                      {"role": "user", "content": safe_prompt}],
+            max_tokens=300,
+            temperature=0.0)
+            
+            safe_sql = safe_response.choices[0].message.content.strip()
+            
+            # Re-validate the new query
+            is_safe_now, new_reason = validate_sql_query(safe_sql)
+            
+            if is_safe_now:
+                return f"-- Note: Original query was modified for security reasons.\n{safe_sql}"
+            else:
+                return f"-- ERROR: Unable to generate a safe SQL query.\n-- Reason: {new_reason}\n-- Please refine your requirement to focus on data retrieval only."
+        
+        return generated_sql
+        
     except Exception as e:
         print(f"Error generating SQL query: {e}")
         return None
@@ -132,7 +223,16 @@ Improved SQL Query:"""
                   {"role": "user", "content": prompt}],
         max_tokens=300,
         temperature=0.5)
-        return response.choices[0].message.content.strip()
+        
+        improved_sql = response.choices[0].message.content.strip()
+        
+        # Validate the improved SQL for safety
+        is_safe, reason = validate_sql_query(improved_sql)
+        if not is_safe:
+            print(f"Warning: Improved SQL contains unsafe elements: {reason}")
+            return f"-- Warning: The improved query contains unsafe elements. Using original query instead.\n-- Reason: {reason}\n{query}"
+            
+        return improved_sql
     except Exception as e:
         print(f"Error improving SQL query: {e}")
         return None
@@ -143,6 +243,7 @@ Improved SQL Query:"""
 def execute_sql_query(query, conn):
     """
     Executes a SQL query on the given database connection and returns the results.
+    Validates the query for security before execution.
 
     Args:
         query (str): The SQL query to execute
@@ -155,11 +256,16 @@ def execute_sql_query(query, conn):
     Raises:
         sqlite3.Error: If there's an error during query execution
     """
+    # Validate query before execution
+    is_safe, reason = validate_sql_query(query)
+    if not is_safe:
+        print(f"Error: Cannot execute potentially unsafe SQL. Reason: {reason}")
+        return f"Error: Cannot execute potentially unsafe SQL. Reason: {reason}"
+        
     try:
         cursor = conn.cursor()
         cursor.execute(query)
         results = cursor.fetchall()
-        cursor.close()  # Good practice to close cursor
         return results
     except sqlite3.Error as e:
         print(f"Error executing SQL query: {e}")
