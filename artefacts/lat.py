@@ -10,6 +10,7 @@ from langchain_core.tools import tool
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 import openai
 from openai import OpenAI
+import sys
 
 from langchain_openai import ChatOpenAI
 from typing import Dict, List, Optional, Any
@@ -17,7 +18,7 @@ from typing import Dict, List, Optional, Any
 # Temporary increase of recursion limit
 sys.setrecursionlimit(10000)
 
-client = OpenAI(api_key=""
+client = OpenAI(api_key="")
 import os
 import sqlite3
 import streamlit as st
@@ -79,6 +80,52 @@ prompt = ChatPromptTemplate.from_messages(
     ]
 )
 
+def validate_sql_query(query):
+    """
+    Validates a SQL query for potentially malicious operations.
+    
+    Args:
+        query (str): The SQL query to validate
+        
+    Returns:
+        tuple: (is_valid, message) where is_valid is a boolean indicating if the query is safe,
+               and message provides details if the query is not safe
+    """
+    if not query or not isinstance(query, str):
+        return False, "Query must be a non-empty string"
+    
+    # Convert to uppercase for easier pattern matching
+    upper_query = query.upper()
+    
+    # Define patterns for dangerous operations
+    dangerous_patterns = [
+        "DROP ", "TRUNCATE ", "ALTER ", 
+        "GRANT ", "REVOKE ", "EXEC ", "EXECUTE ",
+        "CREATE USER", "DROP USER", 
+        "PRAGMA", "ATTACH", "DETACH",
+        ";", "--", "/*", "*/"  # SQL injection patterns
+    ]
+    
+    # Check for dangerous patterns
+    for pattern in dangerous_patterns:
+        if pattern in upper_query:
+            return False, f"Query contains potentially dangerous operation: {pattern}"
+    
+    # For this monitoring application, we primarily allow SELECT queries
+    # We conditionally allow CREATE TABLE/VIEW for setting up monitoring structures
+    allowed_starts = ["SELECT ", "CREATE TABLE ", "CREATE VIEW "]
+    
+    valid_start = False
+    for start in allowed_starts:
+        if upper_query.strip().startswith(start):
+            valid_start = True
+            break
+    
+    if not valid_start:
+        return False, "Query must start with SELECT or specific CREATE operations for monitoring purposes"
+    
+    return True, "Query is valid"
+
 # Define the Agentic  SQL tool using the @tool decorator - To generate SQL
 @tool
 def generate_sql_query(requirement):
@@ -89,7 +136,11 @@ def generate_sql_query(requirement):
        Returns:
            str: Generated SQL query based on the requirement
     """
-    prompt = f"""You are an expert SQL developer. Convert the following requirement into a well-written SQL query:
+    prompt = f"""You are an expert SQL developer. Convert the following requirement into a well-written SQL query.
+    Focus on creating safe, efficient queries for monitoring purposes. 
+    ONLY generate SELECT queries or CREATE TABLE/VIEW statements for monitoring.
+    NEVER include dangerous operations like DROP, TRUNCATE, ALTER, GRANT, REVOKE, or any operations 
+    that could compromise database security.
 
 {requirement}
 
@@ -100,7 +151,15 @@ SQL Query:"""
                   {"role": "user", "content": prompt}],
         max_tokens=300,
         temperature=0.5)
-        return response.choices[0].message.content.strip()
+        
+        generated_query = response.choices[0].message.content.strip()
+        
+        # Validate the generated query
+        is_valid, message = validate_sql_query(generated_query)
+        if not is_valid:
+            return f"Error: Generated query is not safe. {message}"
+        
+        return generated_query
     except Exception as e:
         print(f"Error generating SQL query: {e}")
         return None
@@ -126,10 +185,17 @@ Improved SQL Query:"""
                   {"role": "user", "content": prompt}],
         max_tokens=300,
         temperature=0.5)
-        return response.choices[0].message.content.strip()
+        improved_query = response.choices[0].message.content.strip()
+        
+        # Validate the improved query
+        is_valid, message = validate_sql_query(improved_query)
+        if not is_valid:
+            return f"Error: Improved query is not safe. {message}"
+            
+        return improved_query
     except Exception as e:
         print(f"Error improving SQL query: {e}")
-        return None
+        return query  # Return original query in case of error
 
 
 # Define the SQL tool for query execution
@@ -149,11 +215,17 @@ def execute_sql_query(query, conn):
     Raises:
         sqlite3.Error: If there's an error during query execution
     """
+    # Validate the query before execution
+    is_valid, message = validate_sql_query(query)
+    if not is_valid:
+        print(f"Error: {message}")
+        return None
+        
+    cursor = None
     try:
         cursor = conn.cursor()
         cursor.execute(query)
         results = cursor.fetchall()
-        cursor.close()  # Good practice to close cursor
         return results
     except sqlite3.Error as e:
         print(f"Error executing SQL query: {e}")
