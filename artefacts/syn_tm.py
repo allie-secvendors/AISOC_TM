@@ -1,23 +1,16 @@
 import streamlit as st
 from openai import OpenAI
-
-client = OpenAI(api_key="")
 import sqlite3
+import re  # Added for regex pattern matching in query validation
+import os
 
-# Set up OpenAI API key
-
+# Get OpenAI API key from environment variable
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    st.error("OpenAI API key not found. Please set the OPENAI_API_KEY environment variable.")
 
 # Create an OpenAI client
-client = openai.Completion.create
-
-completion = client.completions.create(
-    model="gpt-3.5-turbo-instruct",
-    prompt={backlog_requirements},
-    temperature=0,
-    max_tokens=500
-)
-
-print(completion.choices[0].text)
+client = OpenAI(api_key=api_key)
 
 # SQLite connection
 conn = sqlite3.connect("your_database.db")
@@ -83,26 +76,95 @@ sql_queries = {
 
 def generate_sql_query(requirement):
     prompt = f"Convert the following requirement into a well-written SQL query:\n\n{requirement}\n\nSQL Query:"
-    response = client.completions.create(engine="text-davinci-002",
-    prompt=prompt,
-    max_tokens=200,
-    n=1,
-    stop=None,
-    temperature=0.7)
+    response = client.completions.create(
+        model="text-davinci-002",
+        prompt=prompt,
+        max_tokens=200,
+        n=1,
+        stop=None,
+        temperature=0.7
+    )
     return response.choices[0].text.strip()
 
 def improve_sql_query(query):
     prompt = f"Improve the following SQL query:\n\n{query}\n\nImproved SQL Query:"
-    response = client.completions.create(engine="text-davinci-002",
-    prompt=prompt,
-    max_tokens=200,
-    n=1,
-    stop=None,
-    temperature=0.7)
+    response = client.completions.create(
+        model="text-davinci-002",
+        prompt=prompt,
+        max_tokens=200,
+        n=1,
+        stop=None,
+        temperature=0.7
+    )
     return response.choices[0].text.strip()
 
+def is_read_only_query(query):
+    """
+    Determines if a query is read-only (safe for execution).
+    """
+    # Strip comments and whitespace for analysis
+    query_clean = " ".join(query.lower().strip().split())
+    
+    # Check if query starts with SELECT and doesn't contain data modification keywords
+    is_select = query_clean.startswith("select")
+    
+    # Some SELECT queries can still modify data (WITH ... UPDATE, etc.)
+    # Check for data modification keywords outside of string literals
+    modify_keywords = ["insert", "update", "delete", "drop", "alter", "truncate", "create", "grant", "revoke"]
+    
+    # Simple check for modification keywords (not perfect for complex queries)
+    for keyword in modify_keywords:
+        # Check if keyword appears as a whole word
+        if re.search(r'\b' + keyword + r'\b', query_clean):
+            return False
+    
+    return is_select
+
+def validate_sql_query(query):
+    """
+    Validates a SQL query for potential security issues.
+    Returns (is_valid, reason) tuple.
+    """
+    if not query or not isinstance(query, str):
+        return False, "Invalid query format"
+    
+    # Check if query is read-only
+    if not is_read_only_query(query):
+        return False, "Only read-only SELECT queries are allowed"
+    
+    # Check for multiple statements (e.g., query; another_query)
+    if ";" in query and not query.rstrip().endswith(";"):
+        return False, "Multiple SQL statements are not allowed"
+    
+    # Check for common SQL injection patterns
+    injection_patterns = [
+        "--", "/*", "*/", 
+        "union all select", "union select", 
+        "or 1=1", "or 1 = 1", 
+        "' or '", "\" or \"", 
+        "'; --", "\"; --"
+    ]
+    
+    query_lower = query.lower()
+    for pattern in injection_patterns:
+        if pattern in query_lower:
+            return False, f"Potential SQL injection pattern detected: {pattern}"
+    
+    return True, "Query validated successfully"
+
 def execute_sql_query(query):
+    """
+    Safely executes a validated SQL query.
+    """
+    # Validate the query first
+    is_valid, reason = validate_sql_query(query)
+    
+    if not is_valid:
+        st.error(f"SQL security validation failed: {reason}")
+        return None
+    
     try:
+        # Execute the validated query
         cursor.execute(query)
         results = cursor.fetchall()
         return results
